@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.DS_Store
+.venv/
+dist/
+build/
+*.egg-info/
+config/viewer.local.yaml
