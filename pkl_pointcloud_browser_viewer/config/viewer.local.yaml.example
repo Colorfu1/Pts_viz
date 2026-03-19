@@ -1,0 +1,10 @@
+pkl_file: /path/to/frame_index.pkl
+eval_dir: /path/to/eval
+host: 127.0.0.1
+port: 8766
+fps: 5.0
+point_size: 2.0
+sample_rate: 1
+label_source: gt
+at720: false
+open_browser: false

@@ -7,4 +7,4 @@ __pycache__/
 dist/
 build/
 *.egg-info/
-config/viewer.local.yaml
+pkl_pointcloud_browser_viewer/config/viewer.local.yaml

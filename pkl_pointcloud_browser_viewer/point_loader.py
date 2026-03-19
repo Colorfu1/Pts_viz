@@ -1,36 +1,86 @@
-"""Point loading adapters for the standalone browser viewer project."""
+"""Frame/bundle loading adapters for the browser viewer project."""
 
 from __future__ import annotations
 
 import importlib
+import importlib.util
 import os
 from pathlib import Path
-from typing import Any
+from types import ModuleType
+from typing import Any, Iterator
 
 import numpy as np
 
 
-def _resolve_custom_loader():
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+
+def _load_module_from_path(module_name: str, module_path: Path) -> ModuleType | None:
+    spec = importlib.util.spec_from_file_location(module_name, module_path)
+    if spec is None or spec.loader is None:
+        return None
+    module = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(module)
+    except ModuleNotFoundError:
+        return None
+    return module
+
+
+def _iter_loader_modules() -> Iterator[ModuleType]:
+    seen: set[str] = set()
+
     loader_spec = os.getenv("PKL_POINTCLOUD_VIEWER_LOADER", "").strip()
     if loader_spec:
-        module_name, sep, func_name = loader_spec.partition(":")
+        module_name, sep, _ = loader_spec.partition(":")
         if not sep:
             raise ValueError(
                 "PKL_POINTCLOUD_VIEWER_LOADER must look like 'package.module:function'"
             )
-        module = importlib.import_module(module_name)
-        return getattr(module, func_name)
+        if module_name not in seen:
+            seen.add(module_name)
+            yield importlib.import_module(module_name)
 
-    for module_name in ("custom_point_loader", ".custom_point_loader"):
+    custom_loader_path = PROJECT_ROOT / "custom_point_loader.py"
+    if custom_loader_path.exists():
+        module_name = "project_custom_point_loader"
+        if module_name not in seen:
+            seen.add(module_name)
+            module = _load_module_from_path(module_name, custom_loader_path)
+            if module is not None:
+                yield module
+
+    for module_name in (
+        "custom_point_loader",
+        ".custom_point_loader",
+        "pkl_pointcloud_browser_viewer.demo_point_loader",
+        ".demo_point_loader",
+    ):
+        canonical_name = module_name.lstrip(".")
+        if canonical_name in seen:
+            continue
         try:
             if module_name.startswith("."):
                 module = importlib.import_module(module_name, package=__package__)
             else:
                 module = importlib.import_module(module_name)
-        except ImportError:
+        except ModuleNotFoundError:
             continue
-        return getattr(module, "load_points", None)
-    return None
+        seen.add(canonical_name)
+        yield module
+
+
+def _resolve_env_callable() -> tuple[Any, str] | tuple[None, None]:
+    loader_spec = os.getenv("PKL_POINTCLOUD_VIEWER_LOADER", "").strip()
+    if not loader_spec:
+        return None, None
+    module_name, sep, func_name = loader_spec.partition(":")
+    if not sep:
+        raise ValueError(
+            "PKL_POINTCLOUD_VIEWER_LOADER must look like 'package.module:function'"
+        )
+    module = importlib.import_module(module_name)
+    return getattr(module, func_name), func_name
 
 
 def _load_points_from_path(path_like: str | Path) -> np.ndarray:
@@ -97,6 +147,28 @@ def _load_builtin_points(source: Any) -> np.ndarray:
     raise TypeError(f"Unsupported point source type: {type(source)!r}")
 
 
+def load_frame_bundle(
+    source_file: str | Path,
+    *,
+    eval_dir: str | Path | None = None,
+    at720: bool = False,
+) -> dict[str, Any] | None:
+    env_callable, env_name = _resolve_env_callable()
+    if env_callable is not None and env_name == "load_frame_bundle":
+        bundle = env_callable(source_file=source_file, eval_dir=eval_dir, at720=at720)
+        if bundle is not None:
+            return bundle
+
+    for module in _iter_loader_modules():
+        load_bundle = getattr(module, "load_frame_bundle", None)
+        if load_bundle is None:
+            continue
+        bundle = load_bundle(source_file=source_file, eval_dir=eval_dir, at720=at720)
+        if bundle is not None:
+            return bundle
+    return None
+
+
 def load_points(lidar_source: Any, at720: bool = False) -> tuple[np.ndarray | None, np.ndarray | None]:
     """Load points for one frame.
 
@@ -106,9 +178,19 @@ def load_points(lidar_source: Any, at720: bool = False) -> tuple[np.ndarray | No
     3. Built-in file loader for path-based sources
     """
 
-    custom_loader = _resolve_custom_loader()
-    if custom_loader is not None:
-        return custom_loader(lidar_source, at720=at720)
+    env_callable, env_name = _resolve_env_callable()
+    if env_callable is not None and env_name == "load_points":
+        result = env_callable(lidar_source, at720=at720)
+        if result is not None:
+            return result
+
+    for module in _iter_loader_modules():
+        custom_loader = getattr(module, "load_points", None)
+        if custom_loader is None:
+            continue
+        result = custom_loader(lidar_source, at720=at720)
+        if result is not None:
+            return result
 
     try:
         points = _load_builtin_points(lidar_source)

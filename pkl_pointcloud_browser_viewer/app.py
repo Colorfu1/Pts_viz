@@ -157,6 +157,17 @@ def load_points_for_frame(lidar_adrn: Any, at720: bool) -> tuple[np.ndarray | No
     return load_points(lidar_adrn, at720=at720)
 
 
+def load_frame_bundle_for_source(
+    source_file: str | Path,
+    *,
+    eval_dir: str | Path | None,
+    at720: bool,
+) -> dict[str, Any] | None:
+    from .point_loader import load_frame_bundle
+
+    return load_frame_bundle(source_file, eval_dir=eval_dir, at720=at720)
+
+
 def _srgb_channel_to_linear_u8(values: np.ndarray) -> np.ndarray:
     normalized = values.astype(np.float32) / 255.0
     linear = np.where(
@@ -180,6 +191,24 @@ STATIC_LABEL_COLORS = np.ascontiguousarray(
     ),
     dtype=np.uint8,
 )
+
+def load_config_layers(config_path: Path) -> tuple[dict[str, Any], Path | None]:
+    config: dict[str, Any] = {}
+    if config_path.exists():
+        with open(config_path, "r", encoding="utf-8") as handle:
+            config = yaml.safe_load(handle) or {}
+        if not isinstance(config, dict):
+            raise TypeError(f"Config file must contain a mapping: {config_path}")
+
+    local_config_path = config_path.with_name(f"{config_path.stem}.local{config_path.suffix}")
+    if local_config_path.exists():
+        with open(local_config_path, "r", encoding="utf-8") as handle:
+            local_config = yaml.safe_load(handle) or {}
+        if not isinstance(local_config, dict):
+            raise TypeError(f"Config file must contain a mapping: {local_config_path}")
+        config.update(local_config)
+        return config, local_config_path
+    return config, None
 
 
 def parse_args() -> argparse.Namespace:
@@ -255,12 +284,10 @@ def parse_args() -> argparse.Namespace:
 
     args = parser.parse_args()
     config_path = Path(args.config).expanduser()
-    config = {}
-    if config_path.exists():
-        with open(config_path, "r", encoding="utf-8") as handle:
-            config = yaml.safe_load(handle) or {}
-        if not isinstance(config, dict):
-            parser.error(f"Config file must contain a mapping: {config_path}")
+    try:
+        config, local_config_path = load_config_layers(config_path)
+    except TypeError as exc:
+        parser.error(str(exc))
 
     defaults = {
         "eval_dir": "",
@@ -298,6 +325,7 @@ def parse_args() -> argparse.Namespace:
     args.at720 = bool(pick("at720"))
     args.open_browser = bool(pick("open_browser"))
     args.config = str(config_path)
+    args.local_config = None if local_config_path is None else str(local_config_path)
     return args
 
 
@@ -328,7 +356,11 @@ class FrameStore:
         self.frame_paths = self._load_frame_index()
         if not self.frame_paths:
             raise FileNotFoundError(f"No frame entries found in {self.pkl_file}")
-        self.has_flow_modality, self.has_static_modality = self._detect_optional_modalities()
+        (
+            self.has_pred_modality,
+            self.has_flow_modality,
+            self.has_static_modality,
+        ) = self._detect_optional_modalities()
 
     def __len__(self) -> int:
         return len(self.frame_paths)
@@ -532,6 +564,140 @@ class FrameStore:
             )
         return detections
 
+    def _normalize_external_detections(self, detections: Any) -> list[dict]:
+        normalized: list[dict] = []
+        if not detections:
+            return normalized
+        for item in detections:
+            if not isinstance(item, dict):
+                continue
+            detection = dict(item)
+            seg_class = int(detection.get("segClass", 12))
+            detection["segClass"] = seg_class
+            detection["bboxClass"] = int(detection.get("bboxClass", -1))
+            detection["score"] = float(detection.get("score", 1.0))
+            detection["yaw"] = float(detection.get("yaw", 0.0))
+            detection["center"] = [float(x) for x in detection.get("center", [0.0, 0.0, 0.0])]
+            detection["size"] = [float(x) for x in detection.get("size", [1.0, 1.0, 1.0])]
+            detection["name"] = str(detection.get("name", "unknown"))
+            if "color" not in detection:
+                detection["color"] = RENDER_CLASSNAME_TO_COLOR[seg_class].tolist()
+            else:
+                detection["color"] = [int(x) for x in detection["color"]]
+            normalized.append(detection)
+        return normalized
+
+    def _default_external_log_info(
+        self,
+        frame_info_path: Path,
+        *,
+        positions: np.ndarray,
+        pred_labels: np.ndarray | None,
+        flow_values: np.ndarray | None,
+        static_labels: np.ndarray | None,
+        gt_detections: list[dict],
+        pred_detections: list[dict],
+    ) -> dict[str, Any]:
+        return {
+            "entries": [
+                {"key": "mode_default", "value": self.label_source},
+                {"key": "frame_file_name", "value": frame_info_path.name},
+                {"key": "frame_file_path", "value": str(frame_info_path)},
+                {"key": "visible_points", "value": len(positions)},
+                {"key": "gt_det_count", "value": len(gt_detections)},
+                {"key": "eval_det_count", "value": len(pred_detections)},
+                {"key": "has_pred_labels", "value": pred_labels is not None},
+                {"key": "has_flow", "value": flow_values is not None},
+                {"key": "has_static_labels", "value": static_labels is not None},
+            ]
+        }
+
+    def _normalize_external_bundle(
+        self,
+        frame_info_path: Path,
+        bundle: dict[str, Any],
+    ) -> dict[str, Any]:
+        points = bundle.get("positions", bundle.get("points"))
+        if points is None:
+            raise ValueError(f"External bundle missing points/positions for {frame_info_path.name}")
+        points = self._ensure_2d_array(points, "positions", 3).astype(np.float32, copy=False)
+        positions = np.ascontiguousarray(points[:, :3], dtype=np.float32)
+
+        gt_labels = bundle.get("gt_labels")
+        if gt_labels is None:
+            gt_labels = np.zeros((len(positions),), dtype=np.int32)
+        gt_labels = self._normalize_label(gt_labels)
+        if len(gt_labels) != len(positions):
+            raise ValueError(
+                f"gt_labels length mismatch for {frame_info_path.name}: {len(gt_labels)} vs {len(positions)}"
+            )
+
+        pred_labels = bundle.get("pred_labels")
+        if pred_labels is not None:
+            pred_labels = self._normalize_label(pred_labels)
+            if len(pred_labels) != len(positions):
+                raise ValueError(
+                    f"pred_labels length mismatch for {frame_info_path.name}: {len(pred_labels)} vs {len(positions)}"
+                )
+
+        flow_values = bundle.get("flow")
+        if flow_values is not None:
+            flow_values = self._ensure_2d_array(flow_values, "flow", 3).astype(np.float32, copy=False)
+            if len(flow_values) != len(positions):
+                raise ValueError(
+                    f"flow length mismatch for {frame_info_path.name}: {len(flow_values)} vs {len(positions)}"
+                )
+
+        static_labels = bundle.get("static_labels")
+        if static_labels is not None:
+            static_labels = np.asarray(static_labels).reshape(-1).astype(np.uint8, copy=False)
+            if len(static_labels) != len(positions):
+                raise ValueError(
+                    f"static_labels length mismatch for {frame_info_path.name}: "
+                    f"{len(static_labels)} vs {len(positions)}"
+                )
+
+        positions, gt_labels, pred_labels, flow_values, static_labels = self._apply_sample_rate(
+            positions,
+            gt_labels.astype(np.int32, copy=False),
+            None if pred_labels is None else pred_labels.astype(np.int32, copy=False),
+            None if flow_values is None else flow_values[:, :3],
+            static_labels,
+            self.sample_rate,
+        )
+
+        gt_detections = self._normalize_external_detections(bundle.get("gt_detections"))
+        pred_detections = self._normalize_external_detections(bundle.get("pred_detections"))
+        log_info = bundle.get("log_info")
+        if not isinstance(log_info, dict) or "entries" not in log_info:
+            log_info = self._default_external_log_info(
+                frame_info_path,
+                positions=positions,
+                pred_labels=pred_labels,
+                flow_values=flow_values,
+                static_labels=static_labels,
+                gt_detections=gt_detections,
+                pred_detections=pred_detections,
+            )
+
+        return {
+            "name": str(bundle.get("name", frame_info_path.name)),
+            "positions": positions,
+            "gt_labels": np.ascontiguousarray(gt_labels.astype(np.int32, copy=False)),
+            "pred_labels": None
+            if pred_labels is None
+            else np.ascontiguousarray(pred_labels.astype(np.int32, copy=False)),
+            "gt_detections": gt_detections,
+            "pred_detections": pred_detections,
+            "flow": None
+            if flow_values is None
+            else np.ascontiguousarray(flow_values[:, :3], dtype=np.float32),
+            "static_labels": None
+            if static_labels is None
+            else np.ascontiguousarray(np.clip(static_labels.astype(np.int32), 0, 1).astype(np.uint8)),
+            "log_info": log_info,
+        }
+
     @staticmethod
     def _to_log_string(value: Any) -> str:
         if value is None:
@@ -583,12 +749,27 @@ class FrameStore:
             ]
         }
 
-    def _detect_optional_modalities(self, max_checks: int = 16) -> tuple[bool, bool]:
+    def _detect_optional_modalities(self, max_checks: int = 16) -> tuple[bool, bool, bool]:
+        has_pred = False
         has_flow = False
         has_static = False
-        if self.eval_dir is None:
-            return has_flow, has_static
         for frame_path in self.frame_paths[:max_checks]:
+            bundle = load_frame_bundle_for_source(
+                frame_path,
+                eval_dir=self.eval_dir,
+                at720=self.at720,
+            )
+            if bundle is not None:
+                has_pred = has_pred or (
+                    bundle.get("pred_labels") is not None or bool(bundle.get("pred_detections"))
+                )
+                has_flow = has_flow or (bundle.get("flow") is not None)
+                has_static = has_static or (bundle.get("static_labels") is not None)
+                if has_pred and has_flow and has_static:
+                    break
+                continue
+            if self.eval_dir is None:
+                continue
             try:
                 with open(frame_path, "rb") as handle:
                     data_info = pickle.load(handle)
@@ -597,13 +778,14 @@ class FrameStore:
                     continue
                 with open(pred_path, "rb") as handle:
                     pred_data = pickle.load(handle)
+                has_pred = has_pred or ("pts_results" in pred_data or "voxel_results" in pred_data)
                 has_flow = has_flow or ("flow_pred" in pred_data)
                 has_static = has_static or ("point_static" in pred_data)
-                if has_flow and has_static:
+                if has_pred and has_flow and has_static:
                     break
             except Exception:
                 continue
-        return has_flow, has_static
+        return has_pred, has_flow, has_static
 
     @staticmethod
     def _pack_vectors(magic: bytes, vectors: np.ndarray) -> bytes:
@@ -636,6 +818,14 @@ class FrameStore:
     @lru_cache(maxsize=2)
     def _load_bundle(self, index: int) -> dict[str, Any]:
         frame_info_path = self._frame_info_path(index)
+        external_bundle = load_frame_bundle_for_source(
+            frame_info_path,
+            eval_dir=self.eval_dir,
+            at720=self.at720,
+        )
+        if external_bundle is not None:
+            return self._normalize_external_bundle(frame_info_path, external_bundle)
+
         with open(frame_info_path, "rb") as handle:
             data_info = pickle.load(handle)
 
@@ -650,25 +840,33 @@ class FrameStore:
             with open(pred_path, "rb") as handle:
                 pred_data = pickle.load(handle)
 
-        point_selector = base_mask
-        if pred_data and pred_data.get("points_voxel_sample_mask") is not None:
-            point_selector = np.asarray(pred_data["points_voxel_sample_mask"])
-            expected_points = int(pred_data.get("current_pts_num", lidar_data.shape[0]))
-            if expected_points != lidar_data.shape[0]:
-                raise ValueError(
-                    f"current_pts_num mismatch for {frame_info_path.name}: {expected_points} vs {lidar_data.shape[0]}"
-                )
+        base_mask = np.asarray(base_mask).astype(bool, copy=False)
+        if pred_data and pred_data.get("valid_pts_mask") is not None:
+            valid_pts_mask = np.asarray(pred_data["valid_pts_mask"]).astype(bool, copy=False)
+            if not np.array_equal(valid_pts_mask, base_mask):
+                raise ValueError(f"valid_pts_mask mismatch for {frame_info_path.name}")
 
-        selected_points = lidar_data[point_selector]
-        range_mask = self._point_range_mask(selected_points)
-        visible_points = selected_points[range_mask]
+        range_mask = self._point_range_mask(lidar_data)
+        visible_points = lidar_data[range_mask]
+        point_selector = None
+        if pred_data and pred_data.get("points_voxel_sample_mask") is not None:
+            point_selector = np.asarray(pred_data["points_voxel_sample_mask"]).astype(bool, copy=False)
+            if len(point_selector) != len(visible_points):
+                raise ValueError(
+                    f"points_voxel_sample_mask length mismatch for {frame_info_path.name}: "
+                    f"{len(point_selector)} vs {len(visible_points)}"
+                )
+            visible_points = visible_points[point_selector]
 
         gt_seg_raw = data_info.get("gt_seg")
         raw_gt_visible = None
         if gt_seg_raw is None:
             gt_labels = np.zeros((len(visible_points),), dtype=np.int32)
         else:
-            raw_gt_visible = np.asarray(gt_seg_raw)[point_selector][range_mask]
+            gt_valid = np.asarray(gt_seg_raw)[base_mask]
+            raw_gt_visible = gt_valid[range_mask]
+            if point_selector is not None:
+                raw_gt_visible = raw_gt_visible[point_selector]
             gt_labels = self._map_raw_gt_labels(raw_gt_visible)
 
         pred_count = None
@@ -677,27 +875,37 @@ class FrameStore:
         static_labels = None
         if pred_data and pred_data.get("pts_results") is not None:
             pred_count = pred_data.get("counts")
-            pred_labels = self._align_pred_array(
-                self._normalize_label(pred_data["pts_results"]),
-                pred_count,
-                len(selected_points),
-                range_mask,
-                "pts_results",
-            )
-            flow_values = self._align_pred_array(
-                pred_data.get("flow_pred"),
-                pred_count,
-                len(selected_points),
-                range_mask,
-                "flow_pred",
-            )
-            static_labels = self._align_pred_array(
-                pred_data.get("point_static"),
-                pred_count,
-                len(selected_points),
-                range_mask,
-                "point_static",
-            )
+            pred_labels = self._normalize_label(pred_data["pts_results"])
+            if pred_count is not None:
+                pred_labels = pred_labels[:pred_count]
+            if len(pred_labels) != len(visible_points):
+                raise ValueError(
+                    f"pts_results length mismatch for {frame_info_path.name}: "
+                    f"{len(pred_labels)} vs {len(visible_points)}"
+                )
+
+            flow_values = pred_data.get("flow_pred")
+            if flow_values is not None:
+                flow_values = np.asarray(flow_values)
+                if pred_count is not None:
+                    flow_values = flow_values[:pred_count]
+                if len(flow_values) != len(pred_labels):
+                    raise ValueError(
+                        f"flow_pred length mismatch for {frame_info_path.name}: "
+                        f"{len(flow_values)} vs {len(pred_labels)}"
+                    )
+
+            static_labels = pred_data.get("point_static")
+            if static_labels is not None:
+                static_labels = np.asarray(static_labels)
+                if pred_count is not None:
+                    static_labels = static_labels[:pred_count]
+                if len(static_labels) != len(pred_labels):
+                    raise ValueError(
+                        f"point_static length mismatch for {frame_info_path.name}: "
+                        f"{len(static_labels)} vs {len(pred_labels)}"
+                    )
+
             ignore_mask = gt_labels != 13
             visible_points = visible_points[ignore_mask]
             gt_labels = gt_labels[ignore_mask]
@@ -707,7 +915,9 @@ class FrameStore:
             if static_labels is not None:
                 static_labels = static_labels[ignore_mask]
         elif data_info.get("flow_gt") is not None:
-            flow_values = np.asarray(data_info["flow_gt"])[point_selector][range_mask]
+            flow_values = np.asarray(data_info["flow_gt"])[range_mask]
+            if point_selector is not None:
+                flow_values = flow_values[point_selector]
 
         positions = np.ascontiguousarray(visible_points[:, :3], dtype=np.float32)
         gt_labels = np.ascontiguousarray(gt_labels.astype(np.int32, copy=False))
@@ -830,7 +1040,7 @@ class FrameStore:
             "sampleRate": self.sample_rate,
             "labelSource": self.label_source,
             "at720": self.at720,
-            "hasEvalResults": self.eval_dir is not None,
+            "hasEvalResults": self.has_pred_modality,
             "hasFlow": self.has_flow_modality,
             "hasStaticLabels": self.has_static_modality,
             "classes": [
@@ -3506,6 +3716,10 @@ def main() -> None:
     print(f"Serving {len(store)} frames from {store.pkl_file}")
     if store.eval_dir is not None:
         print(f"Eval dir: {store.eval_dir}")
+    print(f"Config: {args.config}")
+    if args.local_config:
+        print(f"Local config override: {args.local_config}")
+    print(f"AT720: {'enabled' if store.at720 else 'disabled'}")
     print(f"Open {url}")
     print("Keyboard in browser: Space play/pause, Left/Right step frames")
 

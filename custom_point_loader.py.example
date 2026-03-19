@@ -1,18 +1,36 @@
-"""Example custom point loader for project-specific lidar sources."""
+"""Example frame bundle loader for project-specific datasets."""
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 
-def load_points(lidar_source: Any, at720: bool = False):
-    """Return (points, valid_mask).
+def load_frame_bundle(
+    source_file: str | Path,
+    *,
+    eval_dir: str | Path | None = None,
+    at720: bool = False,
+) -> dict[str, Any] | None:
+    """Return one frame bundle or ``None`` when this loader does not handle the input.
 
-    `points` should be an `NxC` float array with at least xyz in the first 3 columns.
-    `valid_mask` should be a boolean mask aligned with the raw point array before any
-    downstream filtering.
+    Expected return keys:
+    - ``points`` or ``positions``: ``NxC`` array, xyz in the first 3 columns
+    - ``gt_labels``: ``N`` array
+    - optional ``pred_labels`` / ``flow`` / ``static_labels``
+    - optional ``gt_detections`` / ``pred_detections`` as lists of dicts
+    - optional ``log_info`` as ``{"entries": [{"key": ..., "value": ...}, ...]}``
     """
+
     raise NotImplementedError(
         "Implement this file for your own data source, then rename it to "
         "`custom_point_loader.py`."
+    )
+
+
+def load_points(lidar_source: Any, at720: bool = False):
+    """Optional compatibility helper for loaders that still expose point-only access."""
+
+    raise NotImplementedError(
+        "Implement this only if you also need point-only access for debugging helpers."
     )

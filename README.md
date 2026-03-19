@@ -1,50 +1,80 @@
 # PKL Point Cloud Browser Viewer
 
-Standalone browser viewer for PKL-indexed point cloud datasets.
+Browser viewer for large PKL-indexed point cloud datasets.
 
-This project serves a local web app for browsing large point cloud datasets
-without loading every frame into memory up front.
+The top-level PKL is treated as a frame index. Actual points, labels, flow,
+static labels, and detections are loaded only when the browser requests a
+frame.
 
 ## Features
 
-- Lazy per-frame loading for large datasets
-- Browser playback with pause, random jump, frame-id jump, and percent jump
+- Lazy per-frame loading
+- Playback, pause, random jump, frame-id jump, and percent jump
 - GT / prediction switching
-- 3D boxes, score filtering, box picking, and detail popup
+- 3D boxes, score filtering, picking, and detail popup
 - Flow and static-label overlays when present
 - Resizable sidebar and log panels
-- Works behind a reverse-proxy subpath as well as direct local access
+- Direct local access or reverse-proxy subpath access
 
-## Install
+## Quick Start
 
-### Editable install
-
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -e .
-```
-
-Then run:
+Install dependencies and run:
 
 ```bash
-pkl-pointcloud-viewer
-```
-
-### Script-only usage
-
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
 pip install -r requirements.txt
 python3 pkl_pointcloud_viewer.py
 ```
 
+Open:
+
+`http://127.0.0.1:8766/`
+
+For remote access:
+
+```bash
+python3 pkl_pointcloud_viewer.py --host 0.0.0.0
+```
+
+## Demo
+
+Bundled sample data lives in:
+
+`examples/demo_dataset/`
+
+Run the demo:
+
+```bash
+python3 pkl_pointcloud_viewer.py examples/demo_dataset/demo_frame_index.pkl
+```
+
+The bundled demo loader reads the per-frame `.npz` files in that directory and
+returns a full frame bundle with points, labels, flow, and OD boxes.
+
+To regenerate the demo from another local result folder:
+
+```bash
+python3 scripts/build_demo_from_local_results.py \
+  /path/to/local_result_dir \
+  --output-dir examples/demo_dataset \
+  --frames 2 \
+  --stride 16
+```
+
+Stop the viewer with `Ctrl+C`.
+
 ## Configuration
 
-Default config file:
+Base config:
 
 `pkl_pointcloud_browser_viewer/config/viewer.yaml`
+
+Optional local override:
+
+`pkl_pointcloud_browser_viewer/config/viewer.local.yaml`
+
+Start from:
+
+`pkl_pointcloud_browser_viewer/config/viewer.local.yaml.example`
 
 Example:
 
@@ -64,39 +94,52 @@ open_browser: false
 CLI arguments override YAML:
 
 ```bash
-pkl-pointcloud-viewer /path/to/frame_index.pkl --eval-dir /path/to/eval --host 0.0.0.0
+python3 pkl_pointcloud_viewer.py /path/to/frame_index.pkl --eval-dir /path/to/eval --host 0.0.0.0
 ```
 
-## Point Loading
+## Custom Loader
 
-This project intentionally does not include any SSH, private storage, or company-specific SDK logic.
+The viewer resolves a top-level frame index into per-frame `source_file`
+entries, then dispatches each `source_file` to the first loader that can handle
+it.
 
-### Built-in loader
+Preferred loader interface:
 
-The built-in loader supports frame metadata that points to local:
+```python
+load_frame_bundle(source_file, *, eval_dir=None, at720=False) -> dict | None
+```
 
-- `.npy`
-- `.npz`
-- float32 `.bin`
+Return a dict containing any of:
 
-files, either as a single path, a list of paths, or a dict of paths.
+- `points` or `positions`
+- `gt_labels`
+- `pred_labels`
+- `flow`
+- `static_labels`
+- `gt_detections`
+- `pred_detections`
+- `log_info`
 
-### Custom loader
-
-If your frame PKLs reference internal point identifiers or another storage system,
-provide your own loader in one of these ways:
+Two ways to add your own loader:
 
 1. Copy `custom_point_loader.py.example` to `custom_point_loader.py`
-2. Or set an external loader:
+2. Set `PKL_POINTCLOUD_VIEWER_LOADER=your_package.your_module:load_frame_bundle`
 
-```bash
-export PKL_POINTCLOUD_VIEWER_LOADER=your_package.your_module:load_points
-```
+Built-in support covers frame metadata that points to local `.npy`, `.npz`, or
+float32 `.bin` files. The repo also ships with
+[demo_point_loader.py](pkl_pointcloud_browser_viewer/demo_point_loader.py) for
+the bundled demo dataset.
 
-The custom loader must return:
+## How It Works
 
-- `points`: `NxC` float array, with xyz in the first 3 columns
-- `valid_mask`: boolean mask aligned with the raw point array before downstream filtering
+1. `pkl_pointcloud_viewer.py` parses `pkl_file`
+2. `FrameStore._load_frame_index()` expands the top-level PKL into `frame_paths`
+3. When frame `N` is requested, `frame_paths[N]` becomes the per-frame `source_file`
+4. `point_loader.py` dispatches that `source_file` to a loader
+5. The returned frame bundle is normalized and served through `/api/frame`, `/api/det`, `/api/flow`, `/api/static`, and `/api/frame_info`
+
+For the bundled demo, the per-frame `source_file` entries are `.npz` files. For
+other datasets, provide your own loader.
 
 ## Repo Layout
 
@@ -107,14 +150,11 @@ README.md
 LICENSE
 pkl_pointcloud_browser_viewer/
   app.py
+  demo_point_loader.py
   point_loader.py
   config/viewer.yaml
-  vendor/browser_viewer/
+  config/viewer.local.yaml.example
 custom_point_loader.py.example
+scripts/build_demo_from_local_results.py
+examples/demo_dataset/
 ```
-
-## Notes
-
-- The top-level PKL is treated as a frame index only.
-- Actual points, labels, detections, flow, and static labels are loaded when a frame is requested.
-- This keeps very large datasets usable in a browser workflow.
