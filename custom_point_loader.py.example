@@ -29,7 +29,7 @@ def load_frame_bundle(
 
 
 def load_points(lidar_source: Any, at720: bool = False):
-    """Optional compatibility helper for diagnostics such as inspect_frame_alignment.py."""
+    """Optional compatibility helper for loaders that still expose point-only access."""
 
     raise NotImplementedError(
         "Implement this only if you also need point-only access for debugging helpers."

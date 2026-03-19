@@ -192,14 +192,6 @@ STATIC_LABEL_COLORS = np.ascontiguousarray(
     dtype=np.uint8,
 )
 
-
-def infer_at720_from_paths(*values: str | None) -> bool:
-    for value in values:
-        if value and "at720" in str(value).lower():
-            return True
-    return False
-
-
 def load_config_layers(config_path: Path) -> tuple[dict[str, Any], Path | None]:
     config: dict[str, Any] = {}
     if config_path.exists():
@@ -291,7 +283,6 @@ def parse_args() -> argparse.Namespace:
     )
 
     args = parser.parse_args()
-    cli_at720 = args.at720
     config_path = Path(args.config).expanduser()
     try:
         config, local_config_path = load_config_layers(config_path)
@@ -332,14 +323,6 @@ def parse_args() -> argparse.Namespace:
     if args.label_source not in {"gt", "pred"}:
         parser.error(f"label_source must be 'gt' or 'pred', got: {args.label_source}")
     args.at720 = bool(pick("at720"))
-    if args.at720 is False and cli_at720 is None:
-        inferred_at720 = infer_at720_from_paths(args.pkl_file, args.eval_dir)
-        if inferred_at720:
-            print(
-                "[info] Detected 'at720' from dataset paths; enabling at720 automatically. "
-                "Pass --no-at720 to disable."
-            )
-            args.at720 = True
     args.open_browser = bool(pick("open_browser"))
     args.config = str(config_path)
     args.local_config = None if local_config_path is None else str(local_config_path)
@@ -373,8 +356,6 @@ class FrameStore:
         self.frame_paths = self._load_frame_index()
         if not self.frame_paths:
             raise FileNotFoundError(f"No frame entries found in {self.pkl_file}")
-        if not self.at720 and self._infer_at720_from_frame_refs():
-            self.at720 = True
         (
             self.has_pred_modality,
             self.has_flow_modality,
@@ -432,36 +413,6 @@ class FrameStore:
 
     def _frame_info_path(self, index: int) -> Path:
         return self.frame_paths[index]
-
-    def _infer_at720_from_frame_refs(self) -> bool:
-        probe_paths = self.frame_paths[: min(3, len(self.frame_paths))]
-        if infer_at720_from_paths(str(self.pkl_file), "" if self.eval_dir is None else str(self.eval_dir)):
-            return True
-        for frame_path in probe_paths:
-            if infer_at720_from_paths(str(frame_path)):
-                return True
-        for frame_path in probe_paths[:1]:
-            try:
-                with open(frame_path, "rb") as handle:
-                    data_info = pickle.load(handle)
-            except Exception:
-                continue
-            candidates = [
-                data_info.get("adrn"),
-                data_info.get("adrns"),
-                data_info.get("anno_file"),
-            ]
-            flat_values: list[str] = []
-            for value in candidates:
-                if isinstance(value, dict):
-                    flat_values.extend(str(item) for item in value.values())
-                elif isinstance(value, (list, tuple)):
-                    flat_values.extend(str(item) for item in value)
-                elif value:
-                    flat_values.append(str(value))
-            if infer_at720_from_paths(*flat_values):
-                return True
-        return False
 
     def _prediction_path(self, data_info: dict[str, Any]) -> Path | None:
         if self.eval_dir is None:
@@ -3723,15 +3674,12 @@ def make_handler(
                 eval_dir = payload.get("evalDir", "")
                 if not pkl_file:
                     raise ValueError("Missing pklFile")
-                resolved_at720 = at720
-                if not resolved_at720 and infer_at720_from_paths(pkl_file, eval_dir):
-                    resolved_at720 = True
                 store = app_state.open_store(
                     pkl_file=pkl_file,
                     eval_dir=eval_dir,
                     sample_rate=sample_rate,
                     label_source=label_source,
-                    at720=resolved_at720,
+                    at720=at720,
                 )
                 meta = store.meta(fps=fps, point_size=point_size)
                 self._send_json({"meta": meta})
